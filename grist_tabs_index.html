@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Onglets Grist</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+  <style>
+    :root { --radius:12px; --shadow:0 6px 18px rgba(0,0,0,.08); --muted:#667085; }
+    html,body { height:100%; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; padding:16px; box-sizing:border-box; background:#f8fafc; }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    .tab { border:1px solid #e5e7eb; background:#fff; padding:8px 12px; border-radius:999px; cursor:pointer; }
+    .tab.active { background:#111827; color:#fff; border-color:#111827; }
+    .panel { background:#fff; border:1px solid #e5e7eb; border-radius:var(--radius); box-shadow:var(--shadow); padding:12px; }
+    table.kv { width:100%; border-collapse:collapse; }
+    table.kv th { text-align:left; color:#111827; padding:8px 10px; width:240px; background:#f9fafb; border-bottom:1px solid #eee; }
+    table.kv td { padding:8px 10px; border-bottom:1px solid #f1f5f9; }
+    table.grid { width:100%; border-collapse:collapse; margin-top:8px; }
+    table.grid th, table.grid td { padding:8px 10px; border-bottom:1px solid #f1f5f9; text-align:left; }
+    .muted { color:var(--muted); font-style:italic; padding:6px 2px; }
+    .caption { margin:6px 0 12px; color:#334155; }
+    .help { font-size:12px; color:#64748b; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <div id="tabs" class="tabs"></div>
+  <div id="caption" class="caption"></div>
+  <div id="content" class="panel"></div>
+
+  <script>
+  // --------- CONFIG (modifiable sans coder) ---------
+  // 'fields' peut être '*' pour afficher toutes les colonnes du dossier sélectionné.
+  // Pour cibler des colonnes précises, remplace '*' par un tableau d'IDs: ['Etapes','date_de_debut', ...]
+  const CONFIG = {
+    tabs: [
+      { id:'presentation', label:'Présentation', fields:'*' },
+      { id:'procedure',    label:'Procédure',    fields:['Etapes','date_de_debut','date_de_fin','Date_de_fin_suggeree'] },
+      { id:'pj',           label:'Pièces jointes',
+        child: {
+          table: 'tab_PJ_signalement',   // Nom exact de la table PJ
+          fk: 'Dossier',                 // Colonne Ref/RefList pointant vers la table des dossiers
+          columns: ['Nom_fichier','Type','Date','Fichiers'] // 'Fichiers' = colonne Pièces jointes si existante
+        }
+      }
+    ],
+    hideFields: ['id'] // champs du dossier à masquer quand fields='*'
+  };
+  // --------------------------------------------------
+
+  const state = { record:null, token:null, currentTab:null, docInfo:null };
+
+  function h(tag, attrs={}, ...children) {
+    const el = document.createElement(tag);
+    for (const [k,v] of Object.entries(attrs||{})) {
+      if (k === 'class') el.className = v;
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v);
+    }
+    for (const ch of children) el.append(ch?.nodeType ? ch : document.createTextNode(ch ?? ''));
+    return el;
+  }
+
+  function selectTab(id){ state.currentTab = id; renderTabs(); renderContent(); }
+
+  function renderTabs() {
+    const bar = h('div', {class:'tabs'});
+    const active = state.currentTab ?? CONFIG.tabs[0].id;
+    for (const t of CONFIG.tabs) {
+      const btn = h('button', {class:'tab' + (t.id===active?' active':''), onclick:()=>selectTab(t.id)}, t.label);
+      bar.append(btn);
+    }
+    document.getElementById('tabs').replaceChildren(bar);
+
+    const cap = document.getElementById('caption');
+    const docName = state.docInfo?.docName || '';
+    const tableId = state.docInfo?.tableId || '';
+    cap.textContent = (state.record)
+      ? `Dossier #${state.record.id} — ${docName} › ${tableId}`
+      : `Sélectionnez un dossier dans la table liée.`;
+  }
+
+  function pretty(v){
+    if (v == null) return '';
+    if (v && typeof v === 'object' && v.hasOwnProperty('value')) return String(v.value);
+    if (v instanceof Date) return v.toLocaleString();
+    if (Array.isArray(v)) return v.join(', ');
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  }
+
+  function attachmentUrl(id){
+    if (!state.token) return '#';
+    return `${state.token.baseUrl}/attachments/${id}/download?auth=${state.token.token}`;
+  }
+
+  function fieldListFor(record, fieldsSetting) {
+    if (!record) return [];
+    if (fieldsSetting === '*') {
+      return Object.keys(record).filter(k => !CONFIG.hideFields.includes(k));
+    }
+    return fieldsSetting || [];
+  }
+
+  async function renderContent() {
+    const cont = document.getElementById('content');
+    cont.innerHTML = '';
+    const tab = CONFIG.tabs.find(t => t.id === (state.currentTab ?? CONFIG.tabs[0].id));
+    if (!tab) return;
+
+    // 1) Affichage des champs de la ligne courante
+    if (tab.fields && state.record) {
+      const fields = fieldListFor(state.record, tab.fields);
+      const table = h('table', {class:'kv'});
+      for (const f of fields) {
+        const val = state.record[f];
+        table.append(h('tr', {}, h('th', {}, f), h('td', {}, pretty(val))));
+      }
+      cont.append(table);
+    }
+
+    // 2) Affichage d'une table enfant liée (Ref ou RefList)
+    if (tab.child && state.record) {
+      try {
+        // Lecture d'une autre table du document (nécessite 'full' access côté widget)
+        const rows = await grist.docApi.fetchTable(tab.child.table);
+        const recId = state.record.id;
+        const subset = rows.filter(r => {
+          const v = r[tab.child.fk];
+          return Array.isArray(v) ? v.includes(recId) : v === recId;
+        });
+
+        if (!subset.length) {
+          cont.append(h('div',{class:'muted'}, 'Aucune donnée liée.'));
+        } else {
+          const grid = h('table',{class:'grid'});
+          const head = h('tr',{});
+          for (const c of tab.child.columns) head.append(h('th',{}, c));
+          grid.append(head);
+
+          for (const r of subset) {
+            const tr = h('tr',{});
+            for (const c of tab.child.columns) {
+              if (c === 'Fichiers' && Array.isArray(r[c]) && r[c].length) {
+                const wrap = h('div',{});
+                for (const id of r[c]) wrap.append(h('a', {href: attachmentUrl(id), target:'_blank'}, 'Télécharger'), document.createTextNode(' '));
+                tr.append(h('td',{}, wrap));
+              } else {
+                tr.append(h('td',{}, pretty(r[c])));
+              }
+            }
+            grid.append(tr);
+          }
+          cont.append(grid);
+        }
+      } catch (e) {
+        cont.append(h('div',{class:'muted'}, 'Impossible de charger la table liée : ' + e));
+      }
+    }
+
+    if (!tab.fields && !tab.child) {
+      cont.append(h('div',{class:'help'}, 'Configurez les champs/liaisons dans CONFIG.tabs.'));
+    }
+  }
+
+  async function init() {
+    grist.ready({ requiredAccess: 'full' }); // nécessaire pour fetchTable et télécharger des pièces
+    state.docInfo = await grist.docApi.getDocInfo().catch(() => ({}));
+    grist.onRecord(async (record) => {
+      state.record = record || null;
+      if (!state.token) {
+        state.token = await grist.docApi.getAccessToken({ readOnly: true }).catch(() => null);
+      }
+      renderTabs();
+      renderContent();
+    });
+  }
+
+  init();
+  </script>
+</body>
+</html>
